@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from google.cloud import datastore
 from werkzeug.utils import secure_filename
 from google.cloud import storage
@@ -8,6 +8,11 @@ import json
 from six.moves.urllib.request import urlopen
 from jose import jwt
 from authlib.integrations.flask_client import OAuth
+from datetime import timedelta
+from flask import send_file
+from io import BytesIO
+from urllib.parse import urljoin
+
 
 app = Flask(__name__)
 app.secret_key = 'SECRET_KEY'
@@ -240,18 +245,243 @@ def get_user(user_id):
         "sub": user.get("sub")
     }
 
+    base_url = request.host_url
+
     # Optional: avatar_url if present
     if "avatar" in user and user["avatar"]:
-        user_data["avatar_url"] = f"http://localhost:8080/users/{user_id}/avatar"
+        user_data["avatar_url"] = urljoin(base_url, f"users/{user_id}/avatar")
 
     # Include "courses" field for student/instructor roles
     if user.get("role") in ["student", "instructor"]:
         courses = user.get("courses", [])
         user_data["courses"] = [
-            f"http://localhost:8080/courses/{course_id}" for course_id in courses
+            urljoin(base_url, f"courses/{course_id}") for course_id in courses
         ]
 
     return jsonify(user_data), 200
+
+
+
+@app.route('/users/<int:user_id>/avatar', methods=['POST'])
+def upload_user_avatar(user_id):
+    # Step 1: Verify JWT first
+    try:
+        payload = verify_jwt(request)
+    except AuthError:
+        return jsonify({"Error": "Unauthorized"}), 401
+
+    sub = payload.get("sub")
+
+    # Step 2: Permission check
+    user_key = client.key(USERS, user_id)
+    user = client.get(user_key)
+    if not user or user.get("sub") != sub:
+        return jsonify({"Error": "You don't have permission on this resource"}), 403
+
+    # Step 3: Check for 'file' key after JWT & permission validated
+    if 'file' not in request.files:
+        return jsonify({"Error": "The request body is invalid"}), 400
+
+    file = request.files['file']
+    if not file.filename.endswith('.png'):
+        return jsonify({"Error": "Only .png files are accepted"}), 400
+
+    # Upload file to GCS
+    storage_client = storage.Client(project='tarpaulin-461916')
+    bucket = storage_client.bucket("tarpaulin-avatars1234")
+    filename = secure_filename(f"user_{user_id}.png")
+    blob = bucket.blob(filename)
+    blob.upload_from_file(file, content_type='image/png')
+
+    # Update user avatar in datastore
+    user['avatar'] = filename
+    client.put(user)
+
+    avatar_url = f"{request.host_url.rstrip('/')}/users/{user_id}/avatar"
+    return jsonify({"avatar_url": avatar_url}), 200
+
+
+
+
+
+
+
+
+@app.route('/users/<int:user_id>/avatar', methods=['GET'])
+def get_user_avatar(user_id):
+    # Step 1: Verify JWT
+    try:
+        payload = verify_jwt(request)
+    except AuthError as e:
+        return jsonify({"Error": "Unauthorized"}), 401
+
+    sub = payload.get("sub")
+    
+    # Step 2: Fetch the user from Datastore
+    user_key = client.key(USERS, user_id)
+    user = client.get(user_key)
+    
+    if not user:
+        return jsonify({"Error": "User not found"}), 403
+
+    # Step 3: Verify that JWT belongs to this user
+    if user.get("sub") != sub:
+        return jsonify({"Error": "You don't have permission on this resource"}), 403
+
+    # Step 4: Check if avatar exists
+    if 'avatar' not in user or not user['avatar']:
+        return jsonify({"Error": "Not found"}), 404
+
+    # Step 5: Download the avatar file from GCS
+    storage_client = storage.Client(project='tarpaulin-461916')
+    bucket = storage_client.bucket("tarpaulin-avatars1234")
+    blob = bucket.blob(user['avatar'])
+
+    if not blob.exists():
+        return jsonify({"Error": "Avatar file not found in storage"}), 404
+
+    avatar_data = blob.download_as_bytes()
+
+    # Step 6: Send the file as a response
+    return send_file(
+        BytesIO(avatar_data),
+        mimetype='image/png',
+        as_attachment=False,
+        download_name='avatar.png'  # File name doesn't matter per spec
+    )
+
+
+@app.route('/users/<int:user_id>/avatar', methods=['DELETE'])
+def delete_user_avatar(user_id):
+    # Step 1: Verify JWT
+    try:
+        payload = verify_jwt(request)
+    except AuthError as e:
+        return jsonify({"Error": "Unauthorized"}), 401
+
+    sub = payload.get("sub")
+
+    # Step 2: Fetch user from Datastore
+    user_key = client.key(USERS, user_id)
+    user = client.get(user_key)
+
+    if not user:
+        # User not found, but no explicit status mentioned in spec here.
+        # Return 403 as user does not belong to this JWT or not found
+        return jsonify({"Error": "You don't have permission on this resource"}), 403
+
+    # Step 3: Verify JWT belongs to user_id
+    if user.get("sub") != sub:
+        return jsonify({"Error": "You don't have permission on this resource"}), 403
+
+    # Step 4: Check if user has avatar
+    if 'avatar' not in user or not user['avatar']:
+        return jsonify({"Error": "Not found"}), 404
+
+    # Step 5: Delete the avatar file from GCS
+    storage_client = storage.Client(project='tarpaulin-461916')
+    bucket = storage_client.bucket("tarpaulin-avatars1234")
+    blob = bucket.blob(user['avatar'])
+
+    if not blob.exists():
+        # If blob file does not exist in GCS, still treat as 404 (avatar not found)
+        return jsonify({"Error": "Not found"}), 404
+
+    blob.delete()
+
+    # Step 6: Remove avatar reference from user in Datastore
+    user['avatar'] = None
+    client.put(user)
+
+    # Step 7: Return 204 No Content on success
+    return Response(status=204)
+
+
+
+COURSES = "courses"
+
+@app.route('/courses', methods=['POST'])
+def create_course():
+    # Step 1: Verify JWT
+    try:
+        payload = verify_jwt(request)
+    except AuthError as e:
+        return jsonify({"Error": "Unauthorized"}), 401
+
+    # Step 2: Verify user role is admin
+    user_sub = payload.get("sub")
+    user_record = get_user_by_sub(user_sub)
+    if not user_record or user_record.get("role") != "admin":
+        return jsonify({"Error": "You don't have permission on this resource"}), 403
+
+    # Step 3: Validate JSON body
+    if not request.is_json:
+        return jsonify({"Error": "The request body is invalid"}), 400
+
+    data = request.get_json()
+
+    # Required fields and basic validations
+    required_fields = ["subject", "number", "title", "term", "instructor_id"]
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"Error": f"The request body is invalid"}), 400
+
+    subject = data["subject"]
+    number = data["number"]
+    title = data["title"]
+    term = data["term"]
+    instructor_id = data["instructor_id"]
+
+    # Validate field types and constraints
+    if not isinstance(subject, str) or len(subject) > 4 or len(subject) == 0:
+        return jsonify({"Error": "Invalid subject"}), 400
+    if not isinstance(number, int):
+        return jsonify({"Error": "Invalid number"}), 400
+    if not isinstance(title, str) or len(title) > 50 or len(title) == 0:
+        return jsonify({"Error": "Invalid title"}), 400
+    if not isinstance(term, str) or len(term) > 10 or len(term) == 0:
+        return jsonify({"Error": "Invalid term"}), 400
+    if not isinstance(instructor_id, int):
+        return jsonify({"Error": "Invalid instructor_id"}), 400
+
+    # Step 4: Verify instructor exists and is a user in Datastore
+    instructor_key = client.key(USERS, instructor_id)
+    instructor = client.get(instructor_key)
+    if not instructor:
+        return jsonify({"Error": "Instructor does not exist"}), 400
+
+    # Optional: Could also verify instructor's role == 'instructor' if needed
+
+    # Step 5: Create new course entity
+    course_key = client.key(COURSES)
+    course = datastore.Entity(key=course_key)
+    course.update({
+        "subject": subject,
+        "number": number,
+        "title": title,
+        "term": term,
+        "instructor_id": instructor_id
+    })
+
+    client.put(course)
+
+    base_url = request.host_url.rstrip('/')
+    self_url = f"{base_url}/courses/{course.key.id}"
+
+
+    # Step 6: Return 201 Created with course details including its ID
+    response_course = {
+        "id": course.key.id,
+        "subject": subject,
+        "number": number,
+        "title": title,
+        "term": term,
+        "instructor_id": instructor_id,
+        "self": self_url
+    }
+
+    return jsonify(response_course), 201
+
 
 
 
